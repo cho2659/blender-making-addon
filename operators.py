@@ -424,6 +424,14 @@ class CAMERA_OT_add_custom_camera(Operator):
         # Create camera
         camera_data = bpy.data.cameras.new(name="CustomCamera")
         camera_obj = bpy.data.objects.new("CustomCamera", camera_data)
+
+        # Force orthographic projection so masking happens in a flat space by default
+        camera_data.type = 'ORTHO'
+        render = context.scene.render
+        render_width = render.resolution_x * (render.resolution_percentage / 100.0)
+        render_height = render.resolution_y * (render.resolution_percentage / 100.0)
+        longest_side = max(render_width, render_height, 1.0)
+        camera_data.ortho_scale = max(1.0, longest_side / 100.0)
         
         # Link to scene
         context.scene.collection.objects.link(camera_obj)

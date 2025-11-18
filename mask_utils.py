@@ -2,7 +2,7 @@ import bpy
 import gpu
 import json
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from . import camera_utils
 
 # Global handler references
@@ -87,63 +87,186 @@ def check_point_in_mask_3d(camera_obj, mask_region, world_pos):
     # Check if projected point is inside polygon
     return point_in_polygon(screen_pos, points_2d)
 
-def get_object_mask_colors(camera_obj, target_obj, props):
-    """Calculate colors for target object based on mask intersections"""
-    if not target_obj or target_obj.type != 'MESH':
-        return []
-    
-    # Get object vertices in world space
-    mesh = target_obj.data
-    matrix_world = target_obj.matrix_world
-    
-    vertex_colors = []
-    
-    for vert in mesh.vertices:
-        world_pos = matrix_world @ vert.co
-        
-        # Check against all enabled mask regions
-        inside_masks = []
-        
-        for mask in props.mask_regions:
-            if mask.enabled:
-                if check_point_in_mask_3d(camera_obj, mask, world_pos):
-                    inside_masks.append(mask)
-        
-        # Determine color based on mask intersections
-        if len(inside_masks) == 0:
-            # Outside all masks - use first mask's outside color
-            if len(props.mask_regions) > 0:
-                color = props.mask_regions[0].outside_color
-            else:
-                color = (1.0, 0.0, 0.0, 1.0)
-        elif len(inside_masks) == 1:
-            # Inside one mask
-            mask = inside_masks[0]
-            color = mask.inside_color
-            
-            # Apply depth-based transparency
-            camera_space = camera_obj.matrix_world.inverted() @ world_pos
-            distance = -camera_space.z
-            
-            if distance < mask.fade_start:
-                alpha = 1.0 - mask.transparency_at_camera
-            elif distance > mask.fade_end:
-                alpha = 0.0
-            else:
-                fade_range = mask.fade_end - mask.fade_start
-                fade_factor = (distance - mask.fade_start) / fade_range
-                alpha = (1.0 - mask.transparency_at_camera) * (1.0 - fade_factor)
-            
-            color = (color[0], color[1], color[2], alpha)
-        else:
-            # Fix: Highlight overlapping regions with brighter intersection color and full opacity
-            color = props.intersection_color
-            # Ensure full opacity for intersection visibility
-            color = (color[0], color[1], color[2], 1.0)
 
-        vertex_colors.append(color)
-    
-    return vertex_colors
+def _mask_targets_object(mask, target_obj):
+    """Return True if mask should consider the given object"""
+    if not target_obj:
+        return False
+
+    if hasattr(mask, "target_collection") and mask.target_collection:
+        try:
+            return target_obj in mask.target_collection.objects
+        except Exception:
+            return False
+
+    # No explicit collection target - apply to everything
+    return True
+
+
+def _get_applicable_masks(props, target_obj):
+    """Gather enabled masks that apply to the target object"""
+    applicable = []
+
+    for mask in getattr(props, "mask_regions", []):
+        if not mask.enabled or not mask.points:
+            continue
+        if _mask_targets_object(mask, target_obj):
+            applicable.append(mask)
+
+    if applicable:
+        return applicable
+
+    # Fallback: allow any enabled mask if no specific targets were matched
+    for mask in getattr(props, "mask_regions", []):
+        if mask.enabled and mask.points:
+            applicable.append(mask)
+
+    return applicable
+
+
+def _average_mask_color(samples):
+    """Average a list of RGB tuples"""
+    if not samples:
+        return (0.0, 0.0, 0.0)
+
+    total = [0.0, 0.0, 0.0]
+    for color in samples:
+        total[0] += color[0]
+        total[1] += color[1]
+        total[2] += color[2]
+
+    count = float(len(samples))
+    return (total[0] / count, total[1] / count, total[2] / count)
+
+
+def _extract_rgb(color):
+    """Ensure color is returned as RGB tuple"""
+    if not color:
+        return (1.0, 0.0, 0.0)
+
+    if len(color) >= 3:
+        return tuple(color[:3])
+
+    # Fallback if Blender returns scalar
+    return (color, color, color)
+
+
+def build_mask_overlay_geometry(camera_obj, props, target_obj):
+    """
+    Build face-based overlay geometry for the given target object.
+    Returns (positions, colors, indices) suitable for GPU drawing.
+    """
+    if not camera_obj or not target_obj or target_obj.type != 'MESH':
+        return None
+
+    mesh = target_obj.data
+    if not mesh or len(mesh.polygons) == 0:
+        return None
+
+    applicable_masks = _get_applicable_masks(props, target_obj)
+    if not applicable_masks:
+        return None
+
+    matrix_world = target_obj.matrix_world
+
+    try:
+        normal_matrix = matrix_world.to_3x3().inverted().transposed()
+    except Exception:
+        normal_matrix = Matrix.Identity(3)
+
+    # Determine colors
+    fallback_color = _extract_rgb(applicable_masks[0].outside_color
+                                  if applicable_masks else (1.0, 0.0, 0.0))
+
+    # Lighting vectors roughly matching Blender's workbench light
+    key_light = Vector((0.6, 0.4, -0.7)).normalized()
+    fill_light = Vector((-0.3, 0.2, -0.6)).normalized()
+
+    dims = target_obj.dimensions
+    max_dim = max(dims) if dims else 1.0
+    surface_offset = max(0.0005, max_dim * 0.001)
+
+    positions = []
+    colors = []
+    indices = []
+
+    for poly in mesh.polygons:
+        if len(poly.loop_indices) < 3:
+            continue
+
+        world_positions = []
+        world_normals = []
+        loop_indices = []
+
+        for loop_idx in poly.loop_indices:
+            vert_idx = mesh.loops[loop_idx].vertex_index
+            vert = mesh.vertices[vert_idx]
+            world_pos = matrix_world @ vert.co
+            world_positions.append(world_pos)
+
+            vert_normal = vert.normal
+            world_normal = (normal_matrix @ vert_normal).normalized()
+            world_normals.append(world_normal)
+            loop_indices.append(loop_idx)
+
+        sample_points = list(world_positions)
+        if len(world_positions) >= 3:
+            centroid = Vector((0.0, 0.0, 0.0))
+            for pos in world_positions:
+                centroid += pos
+            centroid /= len(world_positions)
+            sample_points.append(centroid)
+
+        for i in range(len(world_positions)):
+            next_idx = (i + 1) % len(world_positions)
+            edge_mid = (world_positions[i] + world_positions[next_idx]) * 0.5
+            sample_points.append(edge_mid)
+
+        inside_samples = []
+        for sample in sample_points:
+            for mask in applicable_masks:
+                if check_point_in_mask_3d(camera_obj, mask, sample):
+                    inside_samples.append(_extract_rgb(mask.inside_color))
+                    break
+
+        coverage = (len(inside_samples) / len(sample_points)) if sample_points else 0.0
+        coverage = max(0.0, min(1.0, coverage))
+
+        if inside_samples:
+            inside_color = _average_mask_color(inside_samples)
+            # Blend to keep some hint of outside color for readability
+            face_color = tuple(
+                fallback_color[i] * (1.0 - coverage) + inside_color[i] * coverage
+                for i in range(3)
+            )
+            alpha = 0.3 + 0.6 * coverage
+        else:
+            face_color = fallback_color
+            alpha = 0.12
+
+        alpha = max(0.05, min(0.65, alpha))
+
+        poly_indices = []
+        for idx, world_pos in enumerate(world_positions):
+            offset_pos = world_pos + world_normals[idx] * surface_offset
+            positions.append(offset_pos)
+
+            world_normal = world_normals[idx]
+            key_diffuse = max(0.0, world_normal.dot(key_light))
+            fill_diffuse = max(0.0, world_normal.dot(fill_light))
+            diffuse = min(1.0, 0.8 * key_diffuse + 0.3 * fill_diffuse + 0.2)
+
+            lit_color = tuple(face_color[j] * diffuse for j in range(3))
+            colors.append((*lit_color, alpha))
+            poly_indices.append(len(positions) - 1)
+
+        for i in range(1, len(poly_indices) - 1):
+            indices.append((poly_indices[0], poly_indices[i], poly_indices[i + 1]))
+
+    if not positions or not indices:
+        return None
+
+    return positions, colors, indices
 
 def draw_viewport_overlay():
     """Draw mask overlay in viewport"""
@@ -177,62 +300,38 @@ def draw_viewport_overlay():
     if not target_objects:
         return
     
-    # Draw overlay for each target object
-    for target_obj in target_objects:
-        draw_object_overlay(camera_obj, target_obj, props)
+    # Draw overlay using the general utility so rendering rules stay unified
+    draw_target_object_coloring(camera_obj, props, override_objects=target_objects)
 
 
 def draw_object_overlay(camera_obj, target_obj, props):
-    """Draw overlay for a single target object with X-ray mode"""
-    # Get vertex colors
-    vertex_colors = get_object_mask_colors(camera_obj, target_obj, props)
-
-    if not vertex_colors:
+    """Draw overlay for a single target object with depth-aware blending"""
+    geometry = build_mask_overlay_geometry(camera_obj, props, target_obj)
+    if not geometry:
         return
 
-    # Create shader for vertex color visualization
+    positions, colors, indices = geometry
     shader = gpu.shader.from_builtin('SMOOTH_COLOR')
-
-    # Prepare vertex positions and colors
-    mesh = target_obj.data
-    matrix_world = target_obj.matrix_world
-
-    positions = []
-    colors = []
-    indices = []
-
-    for poly in mesh.polygons:
-        poly_verts = []
-        for loop_idx in poly.loop_indices:
-            vert_idx = mesh.loops[loop_idx].vertex_index
-            world_pos = matrix_world @ mesh.vertices[vert_idx].co
-            positions.append(world_pos)
-            colors.append(vertex_colors[vert_idx])
-            poly_verts.append(len(positions) - 1)
-
-        # Triangulate polygon
-        for i in range(1, len(poly_verts) - 1):
-            indices.append((poly_verts[0], poly_verts[i], poly_verts[i + 1]))
-
-    if not indices:
-        return
-
-    # Enable X-ray mode: disable depth test so it always shows through
-    gpu.state.depth_test_set('NONE')  # Disable depth testing (X-ray effect)
-    gpu.state.blend_set('ALPHA')      # Enable alpha blending
-
-    # Create batch and draw
     batch = batch_for_shader(
         shader, 'TRIS',
         {"pos": positions, "color": colors},
         indices=indices
     )
 
+    space_data = getattr(bpy.context, "space_data", None)
+    is_xray = False
+    if space_data and hasattr(space_data, 'shading') and hasattr(space_data.shading, 'show_xray'):
+        is_xray = space_data.shading.show_xray
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('ALWAYS' if is_xray else 'LESS_EQUAL')
+    gpu.state.depth_mask_set(False)
+
     shader.bind()
     batch.draw(shader)
 
-    # Reset GPU state
-    gpu.state.depth_test_set('LESS_EQUAL')  # Re-enable standard depth testing
+    gpu.state.depth_mask_set(True)
+    gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.blend_set('NONE')
 
 def enable_viewport_drawing(context):
@@ -728,154 +827,35 @@ def draw_perpendicular_mask_mesh():
     draw_target_object_coloring(camera_obj, props)
 
 
-def draw_target_object_coloring(camera_obj, props):
+def draw_target_object_coloring(camera_obj, props, override_objects=None):
     """
-    Color target objects based on mask regions:
-    - Green if inside mask
-    - Red if outside mask
-    - Uses Blender-style lighting with surface normals
-    - Shows on surface even when overlapped with mask (polygon offset)
+    Color target objects based on mask regions using face-based sampling so entire faces highlight.
+    The overlay is rendered via GPU blending so it sits in a separate compositing pass.
     """
-    import gpu
-    from gpu_extras.batch import batch_for_shader
+    # Determine which objects to draw
+    if override_objects is not None:
+        target_objects = [obj for obj in override_objects if obj and obj.type == 'MESH']
+    else:
+        target_objects = []
 
-    # Get target objects from collection or legacy target_object
-    target_objects = []
+        for mask in props.mask_regions:
+            if not mask.enabled or not mask.target_collection:
+                continue
 
-    for mask in props.mask_regions:
-        if not mask.enabled:
-            continue
-
-        # Get objects from target collection
-        if mask.target_collection:
             for obj in mask.target_collection.objects:
                 if obj.type == 'MESH' and obj not in target_objects:
                     target_objects.append(obj)
 
-    # Fallback to legacy target_objects list
-    if not target_objects and hasattr(props, 'target_objects'):
-        for target_item in props.target_objects:
-            if target_item.obj and target_item.obj.type == 'MESH':
-                target_objects.append(target_item.obj)
+        if not target_objects and hasattr(props, 'target_objects'):
+            for target_item in props.target_objects:
+                if target_item.obj and target_item.obj.type == 'MESH':
+                    target_objects.append(target_item.obj)
 
     if not target_objects:
         return
 
-    # Default Blender workbench lighting (same as mask mesh)
-    key_light = Vector((0.6, 0.4, -0.7))
-    key_light.normalize()
-    fill_light = Vector((-0.3, 0.2, -0.6))
-    fill_light.normalize()
-
-    # Draw each target object with color and lighting based on mask intersection
     for target_obj in target_objects:
-        mesh = target_obj.data
-        matrix_world = target_obj.matrix_world
-        normal_matrix = matrix_world.to_3x3().inverted().transposed()
-
-        # First pass: determine base color per vertex (inside/outside)
-        # Green = OVERLAPPING (inside mask from camera view)
-        # Red = NOT OVERLAPPING (outside mask from camera view)
-        vertex_base_colors = []
-        for vert in mesh.vertices:
-            world_pos = matrix_world @ vert.co
-
-            # Check if vertex is inside any mask region (3D check)
-            is_inside = False
-            green_color = (0.0, 1.0, 0.0)  # Green for overlapping
-            red_color = (1.0, 0.0, 0.0)    # Red for non-overlapping
-
-            for mask in props.mask_regions:
-                if not mask.enabled or not mask.points:
-                    continue
-
-                # Check if point is inside the 3D mask cylinder
-                if check_point_in_mask_3d(camera_obj, mask, world_pos):
-                    is_inside = True
-                    # Use mask's inside color (user adjustable)
-                    green_color = tuple(mask.inside_color[:3])
-                    break
-
-            # If not inside any mask, use outside color from first mask
-            if not is_inside and len(props.mask_regions) > 0:
-                red_color = tuple(props.mask_regions[0].outside_color[:3])
-
-            # Store base color
-            if is_inside:
-                vertex_base_colors.append(green_color)
-            else:
-                vertex_base_colors.append(red_color)
-
-        # Second pass: build rendering data with default Blender shading
-        positions = []
-        colors = []
-        indices = []
-
-        for poly in mesh.polygons:
-            poly_verts = []
-            for loop_idx in poly.loop_indices:
-                vert_idx = mesh.loops[loop_idx].vertex_index
-                world_pos = matrix_world @ mesh.vertices[vert_idx].co
-                positions.append(world_pos)
-
-                # Get vertex normal in world space
-                vert_normal = mesh.vertices[vert_idx].normal
-                world_normal = (normal_matrix @ vert_normal).normalized()
-
-                # Apply default Blender workbench lighting to base color
-                base_color = vertex_base_colors[vert_idx]
-                key_diffuse = max(0.0, world_normal.dot(key_light))
-                fill_diffuse = max(0.0, world_normal.dot(fill_light))
-                diffuse = 0.8 * key_diffuse + 0.3 * fill_diffuse + 0.2
-                diffuse = min(1.0, diffuse)
-
-                # Apply lighting to color - this reveals edges
-                lit_color = tuple(base_color[j] * diffuse for j in range(3))
-                colors.append((*lit_color, 1.0))
-
-                poly_verts.append(len(positions) - 1)
-
-            # Triangulate polygon (simple fan triangulation)
-            for i in range(1, len(poly_verts) - 1):
-                indices.append((poly_verts[0], poly_verts[i], poly_verts[i + 1]))
-
-        if not indices or len(positions) == 0 or len(colors) == 0:
-            continue
-
-        # Draw the colored mesh
-        shader = gpu.shader.from_builtin('SMOOTH_COLOR')
-        batch = batch_for_shader(
-            shader, 'TRIS',
-            {"pos": positions, "color": colors},
-            indices=indices
-        )
-
-        # Enable blending
-        gpu.state.blend_set('ALPHA')
-
-        # Respect depth - don't draw always on top
-        gpu.state.depth_test_set('LESS_EQUAL')
-
-        # Check if X-ray mode is enabled in viewport
-        space_data = bpy.context.space_data
-        is_xray = False
-        if hasattr(space_data, 'shading') and hasattr(space_data.shading, 'show_xray'):
-            is_xray = space_data.shading.show_xray
-
-        # If X-ray mode is on, disable depth writes to see through
-        if is_xray:
-            gpu.state.depth_mask_set(False)
-
-        shader.bind()
-        batch.draw(shader)
-
-        # Reset depth mask
-        if is_xray:
-            gpu.state.depth_mask_set(True)
-
-        # Reset state
-        gpu.state.depth_test_set('LESS_EQUAL')
-        gpu.state.blend_set('NONE')
+        draw_object_overlay(camera_obj, target_obj, props)
 
 
 # ============================================================================

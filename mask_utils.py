@@ -74,8 +74,8 @@ def check_point_in_mask_3d(camera_obj, mask_region, world_pos):
         return False
     
     # Project world position to screen space
-    resolution_x = 1920
-    resolution_y = 1080
+    resolution_x = bpy.context.scene.render.resolution_x
+    resolution_y = bpy.context.scene.render.resolution_y
     
     screen_pos = camera_utils.project_world_to_screen(
         camera_obj, world_pos, resolution_x, resolution_y

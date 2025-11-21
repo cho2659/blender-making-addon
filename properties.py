@@ -22,7 +22,7 @@ def update_show_mask_overlay_callback(self, context):
 
     # Find custom camera
     custom_cameras = [obj for obj in context.scene.objects
-                     if obj.custom_camera_props.is_custom_camera]
+                     if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
     if not custom_cameras:
         return

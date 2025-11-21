@@ -170,9 +170,17 @@ def unregister():
     try:
         mask_utils.disable_viewport_drawing()
         mask_utils.disable_mask_ray_drawing()
-        print("  ✓ Disabled viewport handlers")
+        mask_utils.disable_perpendicular_mask_drawing()
+        print("  ✓ Disabled all viewport handlers")
     except Exception as e:
         print(f"  ✗ Failed to disable handlers: {e}")
+
+    # Clear shader cache
+    try:
+        mask_utils._custom_shader_cache = None
+        print("  ✓ Cleared shader cache")
+    except Exception as e:
+        print(f"  ✗ Failed to clear shader cache: {e}")
 
     # Remove from menu
     try:

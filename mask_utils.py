@@ -742,7 +742,6 @@ def get_mask_shader():
     vertex_shader = """
         uniform mat4 ModelViewProjectionMatrix;
         uniform mat4 ModelMatrix;
-        uniform mat4 ViewMatrix;
         uniform mat3 NormalMatrix;
 
         in vec3 pos;
@@ -763,7 +762,6 @@ def get_mask_shader():
     """
 
     fragment_shader = """
-        uniform mat4 ViewProjectionMatrix;
         uniform mat4 CameraMatrix;
         uniform vec3 CameraPos;
         uniform int CameraType;  // 0 = PERSP, 1 = ORTHO
@@ -1077,7 +1075,6 @@ def draw_target_object_coloring(camera_obj, props):
         shader.uniform_float("ModelMatrix", matrix_world)
         shader.uniform_float("ModelViewProjectionMatrix", view_projection_matrix @ matrix_world)
         shader.uniform_float("NormalMatrix", normal_matrix)
-        shader.uniform_float("ViewProjectionMatrix", view_projection_matrix)
         shader.uniform_float("CameraMatrix", camera_matrix)
 
         # Camera properties

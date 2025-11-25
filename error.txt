@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "C:\Users\USER\AppData\Roaming\Blender Foundation\Blender\4.4\extensions\vscode_development\blender-making-addon\mask_utils.py", line 729, in draw_perpendicular_mask_mesh
+    draw_target_object_coloring(camera_obj, props)
+  File "C:\Users\USER\AppData\Roaming\Blender Foundation\Blender\4.4\extensions\vscode_development\blender-making-addon\mask_utils.py", line 1081, in draw_target_object_coloring
+    shader.uniform_float("CameraPos", camera_obj.location)
+ValueError: GPUShader.uniform_float: uniform CameraPos not found

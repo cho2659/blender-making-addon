@@ -1,8 +1,9 @@
 import bpy
 import gpu
 import json
+import bmesh
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector
+from mathutils import Vector, Matrix
 from . import camera_utils
 
 # Global handler references
@@ -152,7 +153,7 @@ def draw_viewport_overlay():
     # Find active custom camera
     camera_obj = None
     for obj in context.scene.objects:
-        if obj.custom_camera_props.is_custom_camera:
+        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera:
             if obj.custom_camera_props.show_mask_overlay:
                 camera_obj = obj
                 break
@@ -276,7 +277,7 @@ def depsgraph_update_handler(scene, depsgraph):
     # Check if any custom camera exists with overlay enabled
     has_active_overlay = False
     for obj in scene.objects:
-        if obj.custom_camera_props.is_custom_camera:
+        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera:
             if obj.custom_camera_props.show_mask_overlay:
                 has_active_overlay = True
                 break
@@ -378,7 +379,7 @@ def draw_mask_rays():
     # Find active custom camera
     camera_obj = None
     for obj in context.scene.objects:
-        if obj.custom_camera_props.is_custom_camera:
+        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera:
             camera_obj = obj
             break
 
@@ -466,7 +467,7 @@ def draw_perpendicular_mask_mesh():
     # Find active custom camera
     camera_obj = None
     for obj in context.scene.objects:
-        if obj.custom_camera_props.is_custom_camera:
+        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera:
             camera_obj = obj
             break
 
@@ -728,16 +729,204 @@ def draw_perpendicular_mask_mesh():
     draw_target_object_coloring(camera_obj, props)
 
 
+# Custom shader for per-pixel mask testing with workbench lighting
+_custom_shader_cache = None
+
+def get_mask_shader():
+    """Get or create the custom shader for per-pixel mask testing"""
+    global _custom_shader_cache
+
+    if _custom_shader_cache is not None:
+        return _custom_shader_cache
+
+    vertex_shader = """
+        uniform mat4 ModelViewProjectionMatrix;
+        uniform mat4 ModelMatrix;
+        uniform mat3 NormalMatrix;
+
+        in vec3 pos;
+        in vec3 nor;
+        in float selected;
+
+        out vec3 fragWorldPos;
+        out vec3 fragNormal;
+        out float fragSelected;
+
+        void main() {
+            vec4 world_pos = ModelMatrix * vec4(pos, 1.0);
+            fragWorldPos = world_pos.xyz;
+            fragNormal = normalize(NormalMatrix * nor);
+            fragSelected = selected;
+            gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);
+        }
+    """
+
+    fragment_shader = """
+        uniform mat4 CameraMatrix;
+        uniform vec3 CameraPos;
+        uniform int CameraType;  // 0 = PERSP, 1 = ORTHO
+        uniform float CameraAngle;
+        uniform float CameraOrthoScale;
+        uniform float CameraAspect;
+
+        uniform int NumMasks;
+        uniform vec2 MaskPoints[512];  // Flattened array: [mask0_pt0, mask0_pt1, ..., mask1_pt0, ...]
+        uniform int MaskOffsets[16];   // Start index for each mask
+        uniform int MaskLengths[16];   // Number of points per mask
+
+        uniform vec4 InsideColor;
+        uniform vec4 OutsideColor;
+        uniform vec4 IntersectionColor;
+
+        in vec3 fragWorldPos;
+        in vec3 fragNormal;
+        in float fragSelected;
+
+        out vec4 FragColor;
+
+        // Point-in-polygon test (ray casting algorithm)
+        bool pointInPolygon(vec2 point, int startIdx, int numPoints) {
+            bool inside = false;
+            float px = point.x;
+            float py = point.y;
+
+            int j = startIdx + numPoints - 1;
+            for (int i = startIdx; i < startIdx + numPoints; i++) {
+                float xi = MaskPoints[i].x;
+                float yi = MaskPoints[i].y;
+                float xj = MaskPoints[j].x;
+                float yj = MaskPoints[j].y;
+
+                if (((yi > py) != (yj > py)) &&
+                    (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                }
+                j = i;
+            }
+            return inside;
+        }
+
+        // Project world position to camera screen space
+        vec2 worldToScreen(vec3 worldPos) {
+            // Transform to camera space
+            vec4 camSpace = CameraMatrix * vec4(worldPos, 1.0);
+
+            // Check if behind camera
+            if (camSpace.z > 0.0) {
+                return vec2(-9999.0, -9999.0);  // Invalid position
+            }
+
+            // Project to NDC based on camera type
+            vec2 ndc;
+            if (CameraType == 0) {  // PERSP
+                // Perspective projection
+                float depth = -camSpace.z;
+                float height = 2.0 * depth * tan(CameraAngle * 0.5);
+                float width = height * CameraAspect;
+                ndc.x = camSpace.x / (width * 0.5);
+                ndc.y = camSpace.y / (height * 0.5);
+            } else {  // ORTHO
+                // Orthographic projection
+                float width = CameraOrthoScale;
+                float height = width / CameraAspect;
+                ndc.x = camSpace.x / (width * 0.5);
+                ndc.y = camSpace.y / (height * 0.5);
+            }
+
+            // NDC is in [-1, 1] range, convert to [0, 1] for mask coordinates
+            return (ndc + 1.0) * 0.5;
+        }
+
+        // Workbench-style lighting
+        vec3 applyWorkbenchLighting(vec3 baseColor, vec3 normal) {
+            // Match Blender workbench default studio lighting
+            vec3 keyLight = normalize(vec3(0.57, 0.29, -0.77));
+            vec3 fillLight = normalize(vec3(-0.48, 0.28, -0.83));
+            vec3 rimLight = normalize(vec3(-0.2, 1.0, 0.2));
+
+            float keyDiffuse = max(0.0, dot(normal, keyLight));
+            float fillDiffuse = max(0.0, dot(normal, fillLight));
+            float rimDiffuse = max(0.0, dot(normal, rimLight));
+
+            // Workbench-style mixing
+            float diffuse = 0.6 * keyDiffuse + 0.25 * fillDiffuse + 0.15 * rimDiffuse + 0.15;
+            diffuse = clamp(diffuse, 0.0, 1.0);
+
+            return baseColor * diffuse;
+        }
+
+        void main() {
+            // Project fragment world position to screen space
+            vec2 screenPos = worldToScreen(fragWorldPos);
+
+            // Check invalid projection (behind camera)
+            if (screenPos.x < -1000.0) {
+                discard;
+            }
+
+            // Count how many masks this pixel is inside
+            int insideCount = 0;
+            vec4 maskColor = OutsideColor;
+
+            for (int i = 0; i < NumMasks; i++) {
+                if (pointInPolygon(screenPos, MaskOffsets[i], MaskLengths[i])) {
+                    insideCount++;
+                }
+            }
+
+            // Determine base color based on mask overlap
+            if (insideCount == 0) {
+                maskColor = OutsideColor;  // Red - outside all masks
+            } else if (insideCount == 1) {
+                maskColor = InsideColor;   // Green - inside one mask
+            } else {
+                maskColor = IntersectionColor;  // Yellow - overlapping masks
+            }
+
+            // Apply workbench lighting
+            vec3 litColor = applyWorkbenchLighting(maskColor.rgb, fragNormal);
+
+            // Blend with orange for selected geometry (edit mode)
+            if (fragSelected > 0.5) {
+                vec3 orange = vec3(1.0, 0.6, 0.0);
+                litColor = mix(litColor, orange, 0.5);  // 50% blend
+            }
+
+            FragColor = vec4(litColor, maskColor.a);
+        }
+    """
+
+    try:
+        _custom_shader_cache = gpu.types.GPUShader(vertex_shader, fragment_shader)
+        print("✓ Custom mask shader compiled successfully")
+        return _custom_shader_cache
+    except Exception as e:
+        print(f"✗ Failed to create custom mask shader: {e}")
+        print(f"   Error type: {type(e).__name__}")
+        print(f"   Falling back to basic rendering (per-pixel masking disabled)")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def draw_target_object_coloring(camera_obj, props):
     """
-    Color target objects based on mask regions:
+    Color target objects based on mask regions using per-pixel shader:
+    - Per-pixel mask testing (not per-vertex) - allows half-overlapped faces to show split colors
     - Green if inside mask
     - Red if outside mask
-    - Uses Blender-style lighting with surface normals
-    - Shows on surface even when overlapped with mask (polygon offset)
+    - Yellow if overlapping multiple masks
+    - Orange highlight for selected geometry in edit mode
+    - Uses workbench-style lighting with surface normals
+    - Respects depth buffer for occlusion
     """
     import gpu
     from gpu_extras.batch import batch_for_shader
+
+    # Get custom shader
+    shader = get_mask_shader()
+    if shader is None:
+        return
 
     # Get target objects from collection or legacy target_object
     target_objects = []
@@ -761,54 +950,91 @@ def draw_target_object_coloring(camera_obj, props):
     if not target_objects:
         return
 
-    # Default Blender workbench lighting (same as mask mesh)
-    key_light = Vector((0.6, 0.4, -0.7))
-    key_light.normalize()
-    fill_light = Vector((-0.3, 0.2, -0.6))
-    fill_light.normalize()
+    # Prepare mask data for shader
+    mask_points = []
+    mask_offsets = []
+    mask_lengths = []
+    num_masks = 0
 
-    # Draw each target object with color and lighting based on mask intersection
+    for mask in props.mask_regions:
+        if not mask.enabled or not mask.points:
+            continue
+
+        try:
+            points_2d = json.loads(mask.points)
+            if len(points_2d) < 3:
+                continue
+
+            # Store offset and length
+            mask_offsets.append(len(mask_points))
+            mask_lengths.append(len(points_2d))
+
+            # Add points (already in [0, 1] normalized screen space)
+            for pt in points_2d:
+                mask_points.append((pt[0], pt[1]))
+
+            num_masks += 1
+
+        except:
+            continue
+
+    if num_masks == 0:
+        return
+
+    # Pad arrays to match shader limits
+    while len(mask_points) < 512:
+        mask_points.append((0.0, 0.0))
+    while len(mask_offsets) < 16:
+        mask_offsets.append(0)
+    while len(mask_lengths) < 16:
+        mask_lengths.append(0)
+
+    # Get camera properties
+    camera = camera_obj.data
+    camera_type = 0 if camera.type == 'PERSP' else 1
+    camera_angle = camera.angle if camera.type == 'PERSP' else 0.0
+    camera_ortho_scale = camera.ortho_scale if camera.type == 'ORTHO' else 1.0
+
+    # Get render aspect ratio
+    render = bpy.context.scene.render
+    camera_aspect = render.resolution_x / render.resolution_y
+
+    # Get camera matrices
+    camera_matrix = camera_obj.matrix_world.inverted()
+    view_projection_matrix = bpy.context.region_data.perspective_matrix
+
+    # Get colors from first mask
+    inside_color = props.mask_regions[0].inside_color if len(props.mask_regions) > 0 else (0.0, 1.0, 0.0, 1.0)
+    outside_color = props.mask_regions[0].outside_color if len(props.mask_regions) > 0 else (1.0, 0.0, 0.0, 1.0)
+    intersection_color = props.intersection_color if hasattr(props, 'intersection_color') else (1.0, 1.0, 0.0, 1.0)
+
+    # Draw each target object
     for target_obj in target_objects:
         mesh = target_obj.data
         matrix_world = target_obj.matrix_world
         normal_matrix = matrix_world.to_3x3().inverted().transposed()
 
-        # First pass: determine base color per vertex (inside/outside)
-        # Green = OVERLAPPING (inside mask from camera view)
-        # Red = NOT OVERLAPPING (outside mask from camera view)
-        vertex_base_colors = []
-        for vert in mesh.vertices:
-            world_pos = matrix_world @ vert.co
+        # Check if object is in edit mode
+        is_edit_mode = target_obj.mode == 'EDIT'
+        vertex_selected = []
 
-            # Check if vertex is inside any mask region (3D check)
-            is_inside = False
-            green_color = (0.0, 1.0, 0.0)  # Green for overlapping
-            red_color = (1.0, 0.0, 0.0)    # Red for non-overlapping
+        if is_edit_mode:
+            # Get edit mode mesh data
+            bm = bmesh.from_edit_mesh(mesh)
+            bm.verts.ensure_lookup_table()
 
-            for mask in props.mask_regions:
-                if not mask.enabled or not mask.points:
-                    continue
+            # Build selection data
+            for vert in bm.verts:
+                vertex_selected.append(1.0 if vert.select else 0.0)
+        else:
+            # No selection in object mode
+            for _ in mesh.vertices:
+                vertex_selected.append(0.0)
 
-                # Check if point is inside the 3D mask cylinder
-                if check_point_in_mask_3d(camera_obj, mask, world_pos):
-                    is_inside = True
-                    # Use mask's inside color (user adjustable)
-                    green_color = tuple(mask.inside_color[:3])
-                    break
-
-            # If not inside any mask, use outside color from first mask
-            if not is_inside and len(props.mask_regions) > 0:
-                red_color = tuple(props.mask_regions[0].outside_color[:3])
-
-            # Store base color
-            if is_inside:
-                vertex_base_colors.append(green_color)
-            else:
-                vertex_base_colors.append(red_color)
-
-        # Second pass: build rendering data with default Blender shading
+        # Build rendering data
         positions = []
-        colors = []
+        normals = []
+        selected = []
         indices = []
 
         for poly in mesh.polygons:
@@ -821,17 +1047,10 @@ def draw_target_object_coloring(camera_obj, props):
                 # Get vertex normal in world space
                 vert_normal = mesh.vertices[vert_idx].normal
                 world_normal = (normal_matrix @ vert_normal).normalized()
+                normals.append(world_normal)
 
-                # Apply default Blender workbench lighting to base color
-                base_color = vertex_base_colors[vert_idx]
-                key_diffuse = max(0.0, world_normal.dot(key_light))
-                fill_diffuse = max(0.0, world_normal.dot(fill_light))
-                diffuse = 0.8 * key_diffuse + 0.3 * fill_diffuse + 0.2
-                diffuse = min(1.0, diffuse)
-
-                # Apply lighting to color - this reveals edges
-                lit_color = tuple(base_color[j] * diffuse for j in range(3))
-                colors.append((*lit_color, 1.0))
+                # Add selection state
+                selected.append(vertex_selected[vert_idx])
 
                 poly_verts.append(len(positions) - 1)
 
@@ -839,21 +1058,47 @@ def draw_target_object_coloring(camera_obj, props):
             for i in range(1, len(poly_verts) - 1):
                 indices.append((poly_verts[0], poly_verts[i], poly_verts[i + 1]))
 
-        if not indices or len(positions) == 0 or len(colors) == 0:
+        if not indices or len(positions) == 0:
             continue
 
-        # Draw the colored mesh
-        shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+        # Create batch
         batch = batch_for_shader(
             shader, 'TRIS',
-            {"pos": positions, "color": colors},
+            {"pos": positions, "nor": normals, "selected": selected},
             indices=indices
         )
 
-        # Enable blending
+        # Set shader uniforms
+        shader.bind()
+
+        # Matrices
+        shader.uniform_float("ModelMatrix", matrix_world)
+        shader.uniform_float("ModelViewProjectionMatrix", view_projection_matrix @ matrix_world)
+        shader.uniform_float("NormalMatrix", normal_matrix)
+        shader.uniform_float("CameraMatrix", camera_matrix)
+
+        # Camera properties
+        shader.uniform_float("CameraPos", camera_obj.location)
+        shader.uniform_int("CameraType", camera_type)
+        shader.uniform_float("CameraAngle", camera_angle)
+        shader.uniform_float("CameraOrthoScale", camera_ortho_scale)
+        shader.uniform_float("CameraAspect", camera_aspect)
+
+        # Mask data
+        shader.uniform_int("NumMasks", num_masks)
+        shader.uniform_float("MaskPoints", mask_points[:512])
+        shader.uniform_int("MaskOffsets", mask_offsets[:16])
+        shader.uniform_int("MaskLengths", mask_lengths[:16])
+
+        # Colors
+        shader.uniform_float("InsideColor", inside_color)
+        shader.uniform_float("OutsideColor", outside_color)
+        shader.uniform_float("IntersectionColor", intersection_color)
+
+        # Enable blending for transparency
         gpu.state.blend_set('ALPHA')
 
-        # Respect depth - don't draw always on top
+        # Respect depth - objects in front will hide mask colors
         gpu.state.depth_test_set('LESS_EQUAL')
 
         # Check if X-ray mode is enabled in viewport
@@ -866,7 +1111,7 @@ def draw_target_object_coloring(camera_obj, props):
         if is_xray:
             gpu.state.depth_mask_set(False)
 
-        shader.bind()
+        # Draw
         batch.draw(shader)
 
         # Reset depth mask
@@ -1044,7 +1289,7 @@ def update_target_materials():
 
     # Find custom camera
     custom_cameras = [obj for obj in bpy.context.scene.objects
-                     if obj.custom_camera_props.is_custom_camera]
+                     if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
     if not custom_cameras:
         return

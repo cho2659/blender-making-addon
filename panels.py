@@ -17,8 +17,8 @@ class CAMERA_PT_custom_camera_panel(Panel):
         layout = self.layout
         
         # Find custom camera in scene
-        custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
+        custom_cameras = [obj for obj in context.scene.objects
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
         
         if not custom_cameras:
             # No custom camera exists
@@ -175,9 +175,9 @@ class CAMERA_OT_activate_custom_camera(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
-        custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
-        
+        custom_cameras = [obj for obj in context.scene.objects
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
+
         if custom_cameras:
             context.scene.camera = custom_cameras[0]
             
@@ -202,7 +202,7 @@ class CAMERA_OT_toggle_camera_visibility(Operator):
 
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if custom_cameras:
             camera_obj = custom_cameras[0]
@@ -226,7 +226,7 @@ class CAMERA_OT_set_active_mask(Operator):
 
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if custom_cameras:
             camera_obj = custom_cameras[0]

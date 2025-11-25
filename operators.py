@@ -414,8 +414,8 @@ class CAMERA_OT_add_custom_camera(Operator):
     
     def execute(self, context):
         # Check if custom camera already exists
-        custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
+        custom_cameras = [obj for obj in context.scene.objects
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
         
         if custom_cameras:
             self.report({'WARNING'}, "Custom Camera already exists")
@@ -423,6 +423,9 @@ class CAMERA_OT_add_custom_camera(Operator):
         
         # Create camera
         camera_data = bpy.data.cameras.new(name="CustomCamera")
+        # Set default to orthographic
+        camera_data.type = 'ORTHO'
+        camera_data.ortho_scale = 6.0
         camera_obj = bpy.data.objects.new("CustomCamera", camera_data)
         
         # Link to scene
@@ -454,7 +457,7 @@ class CAMERA_OT_load_reference_image(Operator):
     def execute(self, context):
         # Find custom camera
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if not custom_cameras:
             self.report({'ERROR'}, "Make Custom Camera first")
@@ -564,7 +567,7 @@ class CAMERA_OT_add_mask_region(Operator):
     
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
         
         if not custom_cameras:
             self.report({'ERROR'}, "Make Custom Camera first")
@@ -592,7 +595,7 @@ class CAMERA_OT_remove_mask_region(Operator):
 
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if not custom_cameras:
             return {'CANCELLED'}
@@ -661,7 +664,7 @@ class CAMERA_OT_set_target_object(Operator):
     def execute(self, context):
         # Find custom camera
         custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
         
         if not custom_cameras:
             self.report({'ERROR'}, "Make Custom Camera first")
@@ -708,7 +711,7 @@ class CAMERA_OT_add_target_object(Operator):
     
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects 
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
         
         if not custom_cameras:
             self.report({'ERROR'}, "Make Custom Camera first")
@@ -752,7 +755,7 @@ class CAMERA_OT_remove_target_object(Operator):
 
     def execute(self, context):
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if not custom_cameras:
             return {'CANCELLED'}
@@ -778,7 +781,7 @@ class CAMERA_OT_cleanup_temp_files(Operator):
     def execute(self, context):
         # Find custom camera
         custom_cameras = [obj for obj in context.scene.objects
-                         if obj.custom_camera_props.is_custom_camera]
+                         if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if not custom_cameras:
             self.report({'WARNING'}, "No custom camera found")
@@ -854,7 +857,7 @@ class CAMERA_OT_draw_mask(Operator):
     def invoke(self, context, event):
         # Find custom camera
         custom_cameras = [obj for obj in context.scene.objects
-                        if obj.custom_camera_props.is_custom_camera]
+                        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera]
 
         if not custom_cameras:
             self.report({'ERROR'}, "Make Custom Camera first")
@@ -926,7 +929,7 @@ class CAMERA_OT_draw_mask(Operator):
             viewport_pos = (event.mouse_region_x, event.mouse_region_y)
 
             camera_obj = [obj for obj in context.scene.objects
-                        if obj.custom_camera_props.is_custom_camera][0]
+                        if hasattr(obj, 'custom_camera_props') and obj.custom_camera_props.is_custom_camera][0]
 
             # Fix: Removed debug prints for faster response
             if self.opencv_image is not None and self.image_size:

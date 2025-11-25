@@ -763,7 +763,6 @@ def get_mask_shader():
 
     fragment_shader = """
         uniform mat4 CameraMatrix;
-        uniform vec3 CameraPos;
         uniform int CameraType;  // 0 = PERSP, 1 = ORTHO
         uniform float CameraAngle;
         uniform float CameraOrthoScale;
@@ -1078,7 +1077,6 @@ def draw_target_object_coloring(camera_obj, props):
         shader.uniform_float("CameraMatrix", camera_matrix)
 
         # Camera properties
-        shader.uniform_float("CameraPos", camera_obj.location)
         shader.uniform_int("CameraType", camera_type)
         shader.uniform_float("CameraAngle", camera_angle)
         shader.uniform_float("CameraOrthoScale", camera_ortho_scale)

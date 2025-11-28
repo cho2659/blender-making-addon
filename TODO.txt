@@ -1,0 +1,4 @@
+fix list
+1. when moving object mask doesn't match
+2. mask doesn't match user input (smaller)
+3. background image is back object (should be in front)

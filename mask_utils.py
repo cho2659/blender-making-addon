@@ -1084,7 +1084,9 @@ def draw_target_object_coloring(camera_obj, props):
 
         # Mask data
         shader.uniform_int("NumMasks", num_masks)
-        shader.uniform_float("MaskPoints", mask_points[:512])
+        # Flatten list of tuples into single list for shader
+        flattened_points = [coord for pt in mask_points[:512] for coord in pt]
+        shader.uniform_float("MaskPoints", flattened_points)
         shader.uniform_int("MaskOffsets", mask_offsets[:16])
         shader.uniform_int("MaskLengths", mask_lengths[:16])
 

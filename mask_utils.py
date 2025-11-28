@@ -741,22 +741,19 @@ def get_mask_shader():
 
     vertex_shader = """
         uniform mat4 ModelViewProjectionMatrix;
-        uniform mat4 ModelMatrix;
         uniform mat3 NormalMatrix;
 
         in vec3 pos;
         in vec3 nor;
         in float selected;
-        in vec4 color;  // Per-vertex mask color
+        in vec4 color;  // Per-vertex mask color (computed on CPU)
 
-        out vec3 fragWorldPos;
         out vec3 fragNormal;
         out float fragSelected;
         out vec4 fragColor;
 
         void main() {
-            vec4 world_pos = ModelMatrix * vec4(pos, 1.0);
-            fragWorldPos = world_pos.xyz;
+            // Transform normal to world space for lighting calculations
             fragNormal = normalize(NormalMatrix * nor);
             fragSelected = selected;
             fragColor = color;
@@ -765,7 +762,6 @@ def get_mask_shader():
     """
 
     fragment_shader = """
-        in vec3 fragWorldPos;
         in vec3 fragNormal;
         in float fragSelected;
         in vec4 fragColor;  // Pre-computed mask color from CPU
@@ -822,11 +818,19 @@ def get_mask_shader():
 
 def draw_target_object_coloring(camera_obj, props):
     """
-    Color target objects based on mask regions using per-pixel shader:
-    - Per-pixel mask testing (not per-vertex) - allows half-overlapped faces to show split colors
-    - Green if inside mask
-    - Red if outside mask
-    - Yellow if overlapping multiple masks
+    Color target objects based on mask regions using CPU-computed vertex colors.
+
+    IMPLEMENTATION NOTE (Fixed shader uniform error):
+    - Original approach: Per-pixel mask testing in GPU fragment shader
+    - Problem: Blender GPU API limits uniform arrays to 2-16 elements max
+    - Error: "ValueError: sequence length is 512, expected [2 - 16]"
+    - Solution: Moved mask testing from GPU (per-pixel) to CPU (per-vertex)
+
+    Current approach:
+    - Computes vertex colors on CPU using check_point_in_mask_3d()
+    - Passes colors as vertex attributes (no uniform array size limit)
+    - Shader only handles lighting and rendering (much simpler)
+    - Green if inside mask, Red if outside, Yellow if overlapping
     - Orange highlight for selected geometry in edit mode
     - Uses workbench-style lighting with surface normals
     - Respects depth buffer for occlusion
@@ -893,11 +897,12 @@ def draw_target_object_coloring(camera_obj, props):
                 vertex_selected.append(0.0)
 
         # Compute vertex colors on CPU (per-vertex mask testing)
+        # This replaced the original GPU shader approach which failed due to uniform array size limits
         vertex_colors = []
         for vert in mesh.vertices:
             world_pos = matrix_world @ vert.co
 
-            # Check against all enabled mask regions
+            # Check against all enabled mask regions using existing helper function
             inside_masks = []
             for mask in props.mask_regions:
                 if mask.enabled:
@@ -906,11 +911,11 @@ def draw_target_object_coloring(camera_obj, props):
 
             # Determine color based on mask intersections
             if len(inside_masks) == 0:
-                color = outside_color
+                color = outside_color  # Red - outside all masks
             elif len(inside_masks) == 1:
-                color = inside_color
+                color = inside_color   # Green - inside one mask
             else:
-                color = intersection_color
+                color = intersection_color  # Yellow - overlapping masks
 
             vertex_colors.append(color)
 
@@ -958,8 +963,15 @@ def draw_target_object_coloring(camera_obj, props):
         # Set shader uniforms
         shader.bind()
 
-        # Matrices
-        shader.uniform_float("ModelMatrix", matrix_world)
+        # PROBLEM: Blender's GPU shader API cannot accept large uniform arrays (max 2-16 elements).
+        # Original code tried to pass 512 vec2 points as uniforms, which failed with:
+        # "ValueError: sequence length is 512/1024, expected [2 - 16]"
+        #
+        # SOLUTION: Moved mask point-in-polygon testing from GPU (per-pixel) to CPU (per-vertex).
+        # Vertex colors are now pre-computed above and passed as vertex attributes.
+        # This avoids the uniform array size limitation and simplifies the shader.
+        #
+        # Only matrices needed for vertex transformation and lighting
         shader.uniform_float("ModelViewProjectionMatrix", view_projection_matrix @ matrix_world)
         shader.uniform_float("NormalMatrix", normal_matrix)
 
